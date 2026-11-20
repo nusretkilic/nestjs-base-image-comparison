@@ -1,24 +1,122 @@
-# Nestjs specific
-/dist
-/node_modules
-/build
-/tmp
 
+# ==========================================
+# NestJS / Node.js
+# ==========================================
+
+node_modules/
+dist/
+build/
+coverage/
+.nest/
+.cache/
+.tmp/
+.temp/
+tmp/
+
+# ==========================================
+# Environment Variables
+# ==========================================
+
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# ==========================================
 # Logs
-logs
+# ==========================================
+
+logs/
 *.log
 npm-debug.log*
-pnpm-debug.log*
 yarn-debug.log*
-yarn-error.log*
+pnpm-debug.log*
 lerna-debug.log*
+report.*.json
 
-# dotenv environment variable files
-.env
-.env.development
-.env.test
-.env.production
+# ==========================================
+# TypeScript
+# ==========================================
 
-# temp directory
-.temp
-.tmp
+*.tsbuildinfo
+*.d.ts.map
+
+# ==========================================
+# Testing
+# ==========================================
+
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+junit.xml
+
+# ==========================================
+# IDE / Editors
+# ==========================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*.iml
+
+# ==========================================
+# Operating System
+# ==========================================
+
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# ==========================================
+# Package Managers
+# ==========================================
+
+.npm/
+.pnpm-store/
+.yarn/*
+!.yarn/patches/
+!.yarn/plugins/
+!.yarn/releases/
+!.yarn/sdks/
+!.yarn/versions/
+
+# ==========================================
+# Debugging
+# ==========================================
+
+*.pid
+*.seed
+*.pid.lock
+debug.log
+
+# ==========================================
+# Build / Bundler
+# ==========================================
+
+.parcel-cache/
+.turbo/
+.eslintcache
+.stylelintcache
+
+# ==========================================
+# Local Database Files
+# ==========================================
+
+*.sqlite
+*.sqlite3
+*.db
+
+# ==========================================
+# Temporary Files
+# ==========================================
+
+*.bak
+*.tmp
+*.temp
+*.orig
+*.rej
