@@ -11,5 +11,8 @@
     "generate:module": "cd products-api && npx nest g module",
     "generate:controller": "cd products-api && npx nest g controller",
     "generate:service": "cd products-api && npx nest g service"
+  },
+  "engines": {
+    "node": "24.x"
   }
 }
