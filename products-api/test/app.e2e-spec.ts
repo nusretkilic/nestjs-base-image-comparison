@@ -1,4 +1,3 @@
-
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
@@ -161,5 +160,13 @@ describe('Products API (e2e)', () => {
     return request(app.getHttpServer())
       .delete('/products/999')
       .expect(404);
+  });
+
+  // GET /health
+  it('GET /health should return status ok', () => {
+    return request(app.getHttpServer())
+      .get('/health')
+      .expect(200)
+      .expect({ status: 'ok' });
   });
 });
