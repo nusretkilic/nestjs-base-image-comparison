@@ -1,3 +1,4 @@
+
 name: Docker Benchmark CI
 
 on:
@@ -76,6 +77,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           trivy image --download-db-only
 
       - name: Resolve and pull base images
@@ -172,6 +174,11 @@ jobs:
               base_image="$node_image"
             fi
 
+            if [[ -z "$base_image" ]]; then
+              echo "ERROR: Could not resolve runtime base image for $variant"
+              exit 1
+            fi
+
             echo "Scanning runtime base image for $variant: $base_image"
 
             trivy image \
@@ -179,6 +186,12 @@ jobs:
               --format json \
               --output "result/raw/base-scans/${variant}.json" \
               "$base_image"
+
+            # Ensure that an OS package scan was actually performed.
+            jq -e '
+              [.Results[]? | select(.Class == "os-pkgs")]
+              | length > 0
+            ' "result/raw/base-scans/${variant}.json" >/dev/null
           done
 
       - name: Scan production npm dependencies
@@ -186,36 +199,55 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p result/raw/npm-production
+          npm_dir="result/raw/npm-production"
 
-          # Generate a production-only lockfile.
-          # Development dependencies are excluded.
-          cp products-api/package.json \
-            result/raw/npm-production/package.json
+          mkdir -p "$npm_dir"
 
-          cp products-api/package-lock.json \
-            result/raw/npm-production/package-lock.json
+          cp products-api/package.json "$npm_dir/package.json"
+          cp products-api/package-lock.json "$npm_dir/package-lock.json"
 
-          cd result/raw/npm-production
+          echo "Generating production-only npm lockfile"
 
-          npm install \
-            --package-lock-only \
-            --omit=dev \
-            --ignore-scripts \
-            --no-audit \
-            --no-fund
+          (
+            cd "$npm_dir"
 
-          cd ../../..
+            npm install \
+              --package-lock-only \
+              --omit=dev \
+              --ignore-scripts \
+              --no-audit \
+              --no-fund
+          )
 
-          echo "Scanning production npm lockfile"
+          # Check that the generated lockfile contains package entries.
+          jq -e '
+            (.packages | type == "object")
+            and
+            ([.packages | keys[] | select(. != "")] | length > 0)
+          ' "$npm_dir/package-lock.json" >/dev/null
+
+          echo "Scanning production npm dependencies"
 
           trivy fs \
             --scanners vuln \
             --format json \
             --output result/raw/npm-production.json \
-            result/raw/npm-production
+            "$npm_dir"
 
-          echo "Production npm scan completed."
+          # Do not report zero vulnerabilities if Trivy failed to detect
+          # the npm dependency ecosystem.
+          jq -e '
+            [
+              .Results[]?
+              | select(
+                  .Class == "lang-pkgs"
+                  and .Type == "node-pkg"
+                )
+            ]
+            | length > 0
+          ' result/raw/npm-production.json >/dev/null
+
+          echo "Production npm scan completed and validated."
 
       - name: Build, scan and inspect images
         shell: bash
@@ -270,47 +302,117 @@ jobs:
               --output "result/raw/final-scans/${variant}.json" \
               "$image"
 
+            # Validate OS scan results.
+            jq -e '
+              [.Results[]? | select(.Class == "os-pkgs")]
+              | length > 0
+            ' "result/raw/final-scans/${variant}.json" >/dev/null
+
             # Smoke test.
             case "$variant" in
               alpine) port=3101 ;;
               debian) port=3102 ;;
               slim) port=3103 ;;
               distroless) port=3104 ;;
-              *) echo "Unknown variant: $variant"; exit 1 ;;
+              *)
+                echo "Unknown variant: $variant"
+                exit 1
+                ;;
             esac
 
             bash scripts/smoke-test.sh "$image" "$port"
 
-            # Inspect runtime filesystem.
+            # Export runtime filesystem.
             container="inspect-${variant}-${GITHUB_RUN_ID}"
+            filesystem_tar="$(mktemp)"
+
+            cleanup_inspection() {
+              docker rm -f "$container" >/dev/null 2>&1 || true
+              rm -f "$filesystem_tar"
+            }
+
+            trap cleanup_inspection EXIT
 
             docker create \
               --platform linux/amd64 \
               --name "$container" \
               "$image" >/dev/null
 
-            docker export "$container" \
-              | tar -tvf - \
+            docker export "$container" > "$filesystem_tar"
+
+            tar -tvf "$filesystem_tar" \
               > "result/raw/inspection/${variant}-filesystem-details.txt"
 
-            docker export "$container" \
-              | tar -tf - \
+            tar -tf "$filesystem_tar" \
               > "result/raw/inspection/${variant}-filesystem.txt"
 
+            # Inspect actual executable files and executable symlinks.
+            python3 - \
+              "$filesystem_tar" \
+              "result/raw/inspection/${variant}-executables.txt" <<'PY'
+          import posixpath
+          import sys
+          import tarfile
+
+          archive_path = sys.argv[1]
+          output_path = sys.argv[2]
+
+          with tarfile.open(archive_path, "r:*") as archive:
+              members = {}
+
+              for member in archive.getmembers():
+                  name = member.name.lstrip("./")
+                  if name:
+                      members[name] = member
+
+              def is_executable(name, visited=None):
+                  if visited is None:
+                      visited = set()
+
+                  name = posixpath.normpath(name.lstrip("/"))
+
+                  if name in visited or name not in members:
+                      return False
+
+                  visited.add(name)
+                  member = members[name]
+
+                  if member.isfile():
+                      return bool(member.mode & 0o111)
+
+                  if member.issym() or member.islnk():
+                      target = member.linkname
+
+                      if target.startswith("/"):
+                          target = target.lstrip("/")
+                      elif member.issym():
+                          target = posixpath.join(
+                              posixpath.dirname(name),
+                              target
+                          )
+
+                      return is_executable(target, visited)
+
+                  return False
+
+              executables = set()
+
+              for name, member in members.items():
+                  if member.isfile() and member.mode & 0o111:
+                      executables.add(posixpath.basename(name))
+
+                  elif member.issym() or member.islnk():
+                      if is_executable(name):
+                          executables.add(posixpath.basename(name))
+
+              with open(output_path, "w", encoding="utf-8") as output:
+                  for executable in sorted(executables):
+                      output.write(executable + "\n")
+          PY
+
             docker rm "$container" >/dev/null
-
-            filesystem_details="result/raw/inspection/${variant}-filesystem-details.txt"
-
-            # Detect actual executable files, not directory names.
-            awk '
-              $1 ~ /x/ {
-                path = $NF
-                sub(/^.*\//, "", path)
-                print path
-              }
-            ' "$filesystem_details" \
-              | sort -u \
-              > "result/raw/inspection/${variant}-executables.txt"
+            rm -f "$filesystem_tar"
+            trap - EXIT
 
             executables="result/raw/inspection/${variant}-executables.txt"
 
@@ -322,7 +424,11 @@ jobs:
             {
               echo "Variant: $variant"
 
-              if has_executable "sh" || has_executable "ash"; then
+              if has_executable "sh" \
+                || has_executable "ash" \
+                || has_executable "dash" \
+                || has_executable "bash" \
+                || has_executable "busybox"; then
                 echo "Shell: yes"
               else
                 echo "Shell: no"
@@ -339,7 +445,10 @@ jobs:
                 || has_executable "apt-get" \
                 || has_executable "dpkg" \
                 || has_executable "yum" \
-                || has_executable "microdnf"; then
+                || has_executable "microdnf" \
+                || has_executable "dnf" \
+                || has_executable "zypper" \
+                || has_executable "pacman"; then
                 echo "Package manager: yes"
               else
                 echo "Package manager: no"
@@ -395,6 +504,47 @@ jobs:
 
             echo "Completed: $variant"
           done
+
+      - name: Validate all vulnerability scan outputs
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          variants=(alpine debian slim distroless)
+
+          for variant in "${variants[@]}"; do
+            base_file="result/raw/base-scans/${variant}.json"
+            final_file="result/raw/final-scans/${variant}.json"
+
+            test -s "$base_file"
+            test -s "$final_file"
+
+            jq -e '
+              [.Results[]? | select(.Class == "os-pkgs")]
+              | length > 0
+            ' "$base_file" >/dev/null
+
+            jq -e '
+              [.Results[]? | select(.Class == "os-pkgs")]
+              | length > 0
+            ' "$final_file" >/dev/null
+
+            echo "Validated OS scans: $variant"
+          done
+
+          jq -e '
+            [
+              .Results[]?
+              | select(
+                  .Class == "lang-pkgs"
+                  and .Type == "node-pkg"
+                )
+            ]
+            | length > 0
+          ' result/raw/npm-production.json >/dev/null
+
+          echo "All OS and npm vulnerability scans validated."
 
       - name: Generate benchmark reports
         if: always()
@@ -461,7 +611,6 @@ jobs:
               ' "$file"
           }
 
-          # Build the comprehensive Markdown report.
           {
             echo "# Docker Image Benchmark Report"
             echo
@@ -482,6 +631,8 @@ jobs:
             echo "- Base image references are pinned by digest."
             echo "- Runtime base images are scanned separately from final images."
             echo "- Production npm dependencies are scanned from a production-only lockfile."
+            echo "- Development dependencies are excluded from the npm scan."
+            echo "- npm scan output is validated to ensure Trivy detects node-pkg results."
             echo "- Each image is built three times with Docker build cache disabled."
             echo "- The median of the three build times is reported."
             echo "- Base images are pulled before build timing begins."
@@ -614,8 +765,9 @@ jobs:
             echo "- No fix available means Trivy did not report a FixedVersion for that finding."
             echo "- Vulnerability counts are unique by vulnerability ID and package name."
             echo "- The production npm scan uses a lockfile generated with --omit=dev."
-            echo "- The npm results are identical across variants because the application dependencies are identical."
-            echo "- Runtime usability checks identify executable files in the final image filesystem."
+            echo "- The npm scan is shared across variants because application dependencies are identical."
+            echo "- Runtime usability checks inspect executable files and executable symbolic links in the final image filesystem."
+            echo "- Shell is reported when a shell executable or BusyBox shell implementation is present."
             echo "- The base-image scan covers the runtime base image. It does not separately report vulnerabilities in builder-only images."
             echo "- Trivy results depend on the vulnerability database, package metadata and distribution advisories."
             echo "- CVE counts alone do not represent the complete security posture of an image."
@@ -697,33 +849,38 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          from xml.sax.saxutils import escape
+          import re
+          import textwrap
+
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_LEFT
           from reportlab.lib.pagesizes import A4, landscape
           from reportlab.lib.styles import ParagraphStyle
-          from reportlab.lib.enums import TA_LEFT
+          from reportlab.lib.units import mm
           from reportlab.platypus import (
               SimpleDocTemplate,
               Paragraph,
               Spacer,
               Preformatted,
-              PageBreak,
+              LongTable,
+              TableStyle,
           )
-          from reportlab.lib import colors
-          from reportlab.lib.units import mm
-          import re
-          import textwrap
 
           source = Path("result/benchmark-summary.md")
           destination = Path("result/benchmark-summary.pdf")
 
-          content = source.read_text(encoding="utf-8").splitlines()
+          lines = source.read_text(encoding="utf-8").splitlines()
+
+          page_width, _ = landscape(A4)
 
           doc = SimpleDocTemplate(
               str(destination),
               pagesize=landscape(A4),
-              rightMargin=15 * mm,
-              leftMargin=15 * mm,
-              topMargin=15 * mm,
-              bottomMargin=15 * mm,
+              rightMargin=12 * mm,
+              leftMargin=12 * mm,
+              topMargin=13 * mm,
+              bottomMargin=13 * mm,
               title="Docker Image Benchmark Report",
               author="Docker Benchmark CI",
           )
@@ -756,76 +913,232 @@ jobs:
               alignment=TA_LEFT,
           )
 
+          table_header_style = ParagraphStyle(
+              "TableHeader",
+              fontName="Helvetica-Bold",
+              fontSize=6.5,
+              leading=8,
+              textColor=colors.white,
+          )
+
+          table_cell_style = ParagraphStyle(
+              "TableCell",
+              fontName="Helvetica",
+              fontSize=6.5,
+              leading=8,
+          )
+
           code_style = ParagraphStyle(
               "ReportCode",
               fontName="Courier",
-              fontSize=6.5,
+              fontSize=6.2,
               leading=8,
               spaceAfter=5,
           )
 
+          def markdown_to_reportlab(value):
+              value = escape(value)
+              value = re.sub(
+                  r"\*\*(.+?)\*\*",
+                  r"<b>\1</b>",
+                  value
+              )
+              value = re.sub(
+                  r"`([^`]+)`",
+                  r'<font name="Courier">\1</font>',
+                  value
+              )
+              return value
+
+          def parse_table_row(line):
+              return [
+                  cell.strip()
+                  for cell in line.strip().strip("|").split("|")
+              ]
+
+          def is_table_separator(line):
+              cells = parse_table_row(line)
+
+              if not cells:
+                  return False
+
+              return all(
+                  re.fullmatch(r":?-{3,}:?", cell) is not None
+                  for cell in cells
+              )
+
           story = []
+          index = 0
           in_code = False
           code_lines = []
 
           def flush_code():
               global code_lines
-              if code_lines:
-                  wrapped = []
-                  for line in code_lines:
-                      wrapped.extend(
-                          textwrap.wrap(
-                              line,
-                              width=145,
-                              subsequent_indent="  ",
-                              replace_whitespace=False,
-                              drop_whitespace=False,
-                          ) or [""]
-                      )
 
-                  story.append(
-                      Preformatted("\n".join(wrapped), code_style)
+              if not code_lines:
+                  return
+
+              wrapped = []
+
+              for line in code_lines:
+                  wrapped.extend(
+                      textwrap.wrap(
+                          line,
+                          width=150,
+                          subsequent_indent="  ",
+                          replace_whitespace=False,
+                          drop_whitespace=False,
+                      ) or [""]
                   )
-                  code_lines = []
 
-          for line in content:
+              story.append(
+                  Preformatted(
+                      "\n".join(wrapped),
+                      code_style
+                  )
+              )
+
+              code_lines.clear()
+
+          while index < len(lines):
+              line = lines[index]
+
               if line.strip().startswith("```"):
                   if in_code:
                       flush_code()
                       in_code = False
                   else:
                       in_code = True
+
+                  index += 1
                   continue
 
               if in_code:
                   code_lines.append(line)
+                  index += 1
                   continue
 
               if not line.strip():
                   story.append(Spacer(1, 3))
+                  index += 1
+                  continue
+
+              if line.startswith("|"):
+                  table_lines = []
+
+                  while index < len(lines) and lines[index].startswith("|"):
+                      table_lines.append(lines[index])
+                      index += 1
+
+                  if len(table_lines) >= 2:
+                      parsed_rows = [
+                          parse_table_row(row)
+                          for row in table_lines
+                          if not is_table_separator(row)
+                      ]
+
+                      if parsed_rows:
+                          column_count = max(
+                              len(row) for row in parsed_rows
+                          )
+
+                          table_data = []
+
+                          for row_number, row in enumerate(parsed_rows):
+                              row = row + [""] * (
+                                  column_count - len(row)
+                              )
+
+                              style = (
+                                  table_header_style
+                                  if row_number == 0
+                                  else table_cell_style
+                              )
+
+                              table_data.append([
+                                  Paragraph(
+                                      markdown_to_reportlab(cell),
+                                      style
+                                  )
+                                  for cell in row
+                              ])
+
+                          available_width = (
+                              page_width
+                              - doc.leftMargin
+                              - doc.rightMargin
+                          )
+
+                          column_width = (
+                              available_width / column_count
+                          )
+
+                          table = LongTable(
+                              table_data,
+                              colWidths=[
+                                  column_width
+                              ] * column_count,
+                              repeatRows=1,
+                              hAlign="LEFT",
+                          )
+
+                          table.setStyle(TableStyle([
+                              ("BACKGROUND", (0, 0), (-1, 0),
+                               colors.HexColor("#183153")),
+                              ("TEXTCOLOR", (0, 0), (-1, 0),
+                               colors.white),
+                              ("GRID", (0, 0), (-1, -1),
+                               0.35, colors.HexColor("#C8D0D9")),
+                              ("VALIGN", (0, 0), (-1, -1),
+                               "TOP"),
+                              ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                              ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                              ("TOPPADDING", (0, 0), (-1, -1), 3),
+                              ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                              ("ROWBACKGROUNDS", (0, 1), (-1, -1), [
+                                  colors.white,
+                                  colors.HexColor("#F2F5F8"),
+                              ]),
+                          ]))
+
+                          story.append(table)
+                          story.append(Spacer(1, 7))
+
                   continue
 
               if line.startswith("# "):
-                  story.append(Paragraph(line[2:], title_style))
+                  story.append(
+                      Paragraph(
+                          markdown_to_reportlab(line[2:]),
+                          title_style
+                      )
+                  )
+
               elif line.startswith("## "):
-                  story.append(Paragraph(line[3:], heading_style))
-              elif line.startswith("|"):
-                  # Keep report tables readable in a compact monospaced layout.
-                  story.append(Preformatted(line, code_style))
+                  story.append(
+                      Paragraph(
+                          markdown_to_reportlab(line[3:]),
+                          heading_style
+                      )
+                  )
+
               elif line.startswith("- "):
                   story.append(
                       Paragraph(
-                          "&#8226; " + line[2:],
-                          body_style,
+                          "&#8226; " + markdown_to_reportlab(line[2:]),
+                          body_style
                       )
                   )
+
               else:
-                  escaped = (
-                      line.replace("&", "&amp;")
-                          .replace("<", "&lt;")
-                          .replace(">", "&gt;")
+                  story.append(
+                      Paragraph(
+                          markdown_to_reportlab(line),
+                          body_style
+                      )
                   )
-                  story.append(Paragraph(escaped, body_style))
+
+              index += 1
 
           if in_code:
               flush_code()
@@ -834,11 +1147,13 @@ jobs:
               canvas.saveState()
               canvas.setFont("Helvetica", 7)
               canvas.setFillColor(colors.grey)
+
               canvas.drawRightString(
-                  landscape(A4)[0] - 15 * mm,
-                  8 * mm,
+                  landscape(A4)[0] - 12 * mm,
+                  7 * mm,
                   f"Page {document.page}",
               )
+
               canvas.restoreState()
 
           doc.build(
