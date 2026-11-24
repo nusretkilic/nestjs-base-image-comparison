@@ -169,4 +169,52 @@ describe('Products API (e2e)', () => {
       .expect(200)
       .expect({ status: 'ok' });
   });
+
+  // POST /products - validation
+  it('POST /products should reject unexpected fields without creating a product', async () => {
+    await request(app.getHttpServer())
+      .post('/products')
+      .send({
+        name: 'Mechanical Keyboard',
+        description: 'RGB mechanical keyboard',
+        price: 99.99,
+        unexpectedField: true,
+      })
+      .expect(400);
+
+    return request(app.getHttpServer())
+      .get('/products')
+      .expect(200)
+      .expect([]);
+  });
+
+  // PATCH /products/:id - validation
+  it('PATCH /products/:id should reject unexpected fields without updating the product', async () => {
+    await request(app.getHttpServer())
+      .post('/products')
+      .send({
+        name: 'Mechanical Keyboard',
+        description: 'RGB mechanical keyboard',
+        price: 99.99,
+      })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .patch('/products/1')
+      .send({
+        price: 129.99,
+        unexpectedField: true,
+      })
+      .expect(400);
+
+    return request(app.getHttpServer())
+      .get('/products/1')
+      .expect(200)
+      .expect({
+        id: 1,
+        name: 'Mechanical Keyboard',
+        description: 'RGB mechanical keyboard',
+        price: 99.99,
+      });
+  });
 });
