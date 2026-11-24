@@ -1,11 +1,12 @@
-
 name: Docker Benchmark CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -13,10 +14,12 @@ permissions:
 
 jobs:
   benchmark:
+    name: Docker image benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install tools
@@ -29,11 +32,12 @@ jobs:
 
           TRIVY_VERSION="0.69.3"
 
-          curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/v${TRIVY_VERSION}/contrib/install.sh" \
+          curl -sfL \
+            "https://raw.githubusercontent.com/aquasecurity/trivy/v${TRIVY_VERSION}/contrib/install.sh" \
             | sudo sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"
 
+          docker --version
           trivy --version
-          trivy image --download-db-only
 
       - name: Collect environment metadata
         shell: bash
@@ -43,213 +47,276 @@ jobs:
           mkdir -p result/raw
 
           {
-            echo "Scan date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "Git commit: $GITHUB_SHA"
-            echo "Architecture: $(uname -m)"
-            echo ""
+            echo "Benchmark date (UTC): $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Git commit: $(git rev-parse HEAD)"
+            echo "Git branch: ${GITHUB_REF_NAME}"
+            echo "Runner OS: ${RUNNER_OS}"
+            echo "Runner architecture: $(uname -m)"
             echo "Docker version:"
-            docker version
-            echo ""
-            echo "Trivy version and database metadata:"
+            docker --version
+            echo
+            echo "Trivy version:"
             trivy --version
-          } > result/raw/environment.txt
+          } | tee result/raw/environment.txt
 
-      - name: Prepare result tables
+      - name: Download Trivy vulnerability database
+        shell: bash
+        run: |
+          set -euo pipefail
+          trivy image --download-db-only
+
+      - name: Resolve and pull base images
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > result/ci-results.csv <<'EOF'
-          Variant,Node Version,Base Image,Base Image ID,Base Repo Digests,Final Image ID,Build Median Seconds,Smoke Test,Shell,Bash,Package Manager,Debug Tools,Image Size MB
-          EOF
+          get_arg_value() {
+            local dockerfile="$1"
+            local arg_name="$2"
 
-          cat > result/ci-results.md <<'EOF'
-          # Docker Benchmark Results
+            awk -v wanted="$arg_name" '
+              $1 == "ARG" {
+                name = $2
+                sub(/=.*/, "", name)
 
-          | Variant | Node | Build median (s) | Smoke test | Shell | Bash | Package manager | Debug tools | Image size (MB) |
-          |---|---|---:|---|---|---|---|---|---:|
-          EOF
+                if (name == wanted) {
+                  value = $2
+                  sub(/^[^=]*=/, "", value)
+                  print value
+                  exit
+                }
+              }
+            ' "$dockerfile"
+          }
 
-          cat > result/trivy-results.csv <<'EOF'
-          Variant,Scope,Category,Severity,Total,Fix Available,No Fix Available
-          EOF
+          base_images_file="$(mktemp)"
+          trap 'rm -f "$base_images_file"' EXIT
 
-          cat > result/trivy-results.md <<'EOF'
-          # Trivy Vulnerability Results
+          for dockerfile in products-api/Dockerfile.*; do
+            echo "Reading $dockerfile"
 
-          Counts are unique by vulnerability ID and package name.
+            node_image="$(get_arg_value "$dockerfile" NODE_IMAGE)"
+            runtime_image="$(get_arg_value "$dockerfile" RUNTIME_IMAGE)"
 
-          | Variant | Scope | Category | Severity | Total | Fix available | No fix available |
-          |---|---|---|---|---:|---:|---:|
-          EOF
-
-      - name: Pull base images
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          for variant in alpine debian slim distroless; do
-            dockerfile="products-api/Dockerfile.$variant"
-
-            if [[ ! -f "$dockerfile" ]]; then
-              echo "Missing Dockerfile: $dockerfile"
-              exit 1
+            if [[ -n "$node_image" ]]; then
+              echo "$node_image" >> "$base_images_file"
             fi
 
-            echo "Pulling base images for $variant"
-
-            while IFS= read -r image; do
-              [[ -z "$image" ]] && continue
-              docker pull "$image"
-            done < <(
-              awk '
-                $1 == "FROM" {
-                  for (i=2; i<=NF; i++) {
-                    if ($i !~ /^--/) {
-                      print $i
-                      break
-                    }
-                  }
-                }
-              ' "$dockerfile" | sort -u
-            )
+            if [[ -n "$runtime_image" ]]; then
+              echo "$runtime_image" >> "$base_images_file"
+            fi
           done
 
-      - name: Build, scan and test
+          sort -u "$base_images_file" -o "$base_images_file"
+
+          while IFS= read -r image; do
+            [[ -z "$image" ]] && continue
+
+            echo "Pulling base image: $image"
+            docker pull "$image"
+          done < "$base_images_file"
+
+          cp "$base_images_file" result/raw/base-images.txt
+
+      - name: Scan base images
         shell: bash
         run: |
           set -euo pipefail
 
-          get_runtime_base() {
-            awk '
-              $1 == "FROM" {
-                for (i=2; i<=NF; i++) {
-                  if ($i !~ /^--/) {
-                    image=$i
-                    break
-                  }
+          mkdir -p result/raw/base-scans
+
+          get_arg_value() {
+            local dockerfile="$1"
+            local arg_name="$2"
+
+            awk -v wanted="$arg_name" '
+              $1 == "ARG" {
+                name = $2
+                sub(/=.*/, "", name)
+
+                if (name == wanted) {
+                  value = $2
+                  sub(/^[^=]*=/, "", value)
+                  print value
+                  exit
                 }
               }
-              END {
-                print image
+            ' "$dockerfile"
+          }
+
+          for dockerfile in products-api/Dockerfile.*; do
+            variant="${dockerfile##*.}"
+
+            node_image="$(get_arg_value "$dockerfile" NODE_IMAGE)"
+            runtime_image="$(get_arg_value "$dockerfile" RUNTIME_IMAGE)"
+
+            if [[ -n "$runtime_image" ]]; then
+              base_image="$runtime_image"
+            else
+              base_image="$node_image"
+            fi
+
+            echo "Scanning base image for $variant: $base_image"
+
+            trivy image \
+              --scanners vuln \
+              --format json \
+              --output "result/raw/base-scans/${variant}.json" \
+              "$base_image"
+          done
+
+      - name: Build, scan and inspect images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p result/raw/final-scans
+          mkdir -p result/raw/build-times
+          mkdir -p result/raw/inspection
+
+          get_arg_value() {
+            local dockerfile="$1"
+            local arg_name="$2"
+
+            awk -v wanted="$arg_name" '
+              $1 == "ARG" {
+                name = $2
+                sub(/=.*/, "", name)
+
+                if (name == wanted) {
+                  value = $2
+                  sub(/^[^=]*=/, "", value)
+                  print value
+                  exit
+                }
               }
-            ' "$1"
+            ' "$dockerfile"
+          }
+
+          get_runtime_base() {
+            local dockerfile="$1"
+            local runtime_image
+
+            runtime_image="$(get_arg_value "$dockerfile" RUNTIME_IMAGE)"
+
+            if [[ -n "$runtime_image" ]]; then
+              echo "$runtime_image"
+            else
+              get_arg_value "$dockerfile" NODE_IMAGE
+            fi
           }
 
           summarize_scan() {
-            local file="$1"
-            local variant="$2"
-            local scope="$3"
+            local scan_file="$1"
+            local package_class="$2"
+            local severity="$3"
+            local fixed_status="$4"
 
-            for category in OS NPM; do
-              for severity in CRITICAL HIGH MEDIUM LOW UNKNOWN; do
-
-                counts=$(jq -r \
-                  --arg category "$category" \
-                  --arg severity "$severity" '
-                  [
-                    .Results[]?
-                    | select(
-                        ($category == "OS" and .Class == "os-pkgs")
-                        or
-                        ($category == "NPM" and ((.Type // "" | ascii_downcase) == "npm"))
-                      )
-                    | .Vulnerabilities[]?
-                    | select((.Severity // "UNKNOWN") == $severity)
-                    | {
-                        id: (.VulnerabilityID // ""),
-                        pkg: (.PkgName // ""),
-                        fixed: ((.FixedVersion // "") != "")
-                      }
-                  ]
-                  | unique_by([.id, .pkg])
-                  | [
-                      length,
-                      (map(select(.fixed == true)) | length),
-                      (map(select(.fixed == false)) | length)
-                    ]
-                  | @csv
-                  ' "$file")
-
-                IFS=, read -r total fixed no_fix <<< "$counts"
-
-                echo "$variant,$scope,$category,$severity,$total,$fixed,$no_fix" \
-                  >> result/trivy-results.csv
-
-                echo "| $variant | $scope | $category | $severity | $total | $fixed | $no_fix |" \
-                  >> result/trivy-results.md
-              done
-            done
+            jq -r \
+              --arg package_class "$package_class" \
+              --arg severity "$severity" \
+              --arg fixed_status "$fixed_status" '
+                [
+                  .Results[]?.Vulnerabilities[]?
+                  | select(
+                      if $package_class == "os" then
+                        .Class == "os-pkgs"
+                      elif $package_class == "npm" then
+                        .Type == "npm"
+                      else
+                        true
+                      end
+                    )
+                  | select(
+                      if $severity == "ALL" then
+                        true
+                      else
+                        ((.Severity // "UNKNOWN") | ascii_upcase) == $severity
+                      end
+                    )
+                  | select(
+                      if $fixed_status == "fixed" then
+                        ((.FixedVersion // "") != "")
+                      elif $fixed_status == "unfixed" then
+                        ((.FixedVersion // "") == "")
+                      else
+                        true
+                      end
+                    )
+                  | {
+                      id: (.VulnerabilityID // "UNKNOWN"),
+                      package: (.PkgName // "UNKNOWN")
+                    }
+                ]
+                | unique_by([.id, .package])
+                | length
+              ' "$scan_file"
           }
 
-          overall_failed=0
+          variants=(alpine debian slim distroless)
 
-          for variant in alpine debian slim distroless; do
-            echo "===== $variant ====="
+          for variant in "${variants[@]}"; do
+            dockerfile="products-api/Dockerfile.${variant}"
+            image="products-api:${variant}"
 
-            dockerfile="products-api/Dockerfile.$variant"
-            image="products-api:$variant"
+            echo "========================================"
+            echo "Benchmarking: $variant"
+            echo "========================================"
 
-            base_image=$(get_runtime_base "$dockerfile")
+            base_image="$(get_runtime_base "$dockerfile")"
 
             if [[ -z "$base_image" ]]; then
-              echo "Could not determine runtime base image."
+              echo "ERROR: Could not resolve runtime base image for $variant"
               exit 1
             fi
 
+            echo "Runtime base image: $base_image"
+
             {
               echo "Variant: $variant"
-              echo "Scan date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-              echo "Base image: $base_image"
-            } > "result/raw/metadata-$variant.txt"
+              echo "Dockerfile: $dockerfile"
+              echo "Runtime base image: $base_image"
+              echo "Base image digest:"
+              docker image inspect "$base_image" \
+                --format '{{json .RepoDigests}}'
+            } > "result/raw/inspection/${variant}-metadata.txt"
 
-            # Scan base image
-            trivy image --scanners vuln \
-              --format json \
-              --output "result/raw/trivy-base-$variant.json" \
-              "$base_image"
-
-            summarize_scan \
-              "result/raw/trivy-base-$variant.json" "$variant" "BASE"
-
-            # Three cache-free builds measured with GNU time
-            build_times=()
-
+            # Build three times without using the build cache.
             for run in 1 2 3; do
               echo "Build $run/3: $variant"
 
-              /usr/bin/time -f "%e" \
-                -o "result/raw/build-time-$variant-$run.txt" \
+              /usr/bin/time \
+                -f "%e" \
+                -o "result/raw/build-times/${variant}-${run}.txt" \
                 docker build \
                   --no-cache \
-                  -f "$dockerfile" \
-                  -t "$image" \
+                  --pull=false \
+                  --file "$dockerfile" \
+                  --tag "$image" \
                   products-api
-
-              build_times+=(
-                "$(cat "result/raw/build-time-$variant-$run.txt")"
-              )
             done
 
-            printf '%s\n' "${build_times[@]}" \
-              > "result/raw/build-times-$variant.txt"
+            median_time="$(
+              cat "result/raw/build-times/${variant}-"*.txt \
+                | sort -n \
+                | sed -n '2p'
+            )"
 
-            build_median=$(
-              printf '%s\n' "${build_times[@]}" |
-                sort -n |
-                sed -n '2p'
-            )
+            echo "$median_time" \
+              > "result/raw/build-times/${variant}-median.txt"
 
-            # Scan final application image
-            trivy image --scanners vuln \
+            # Scan final image.
+            echo "Scanning final image: $image"
+
+            trivy image \
+              --scanners vuln \
               --format json \
-              --output "result/raw/trivy-final-$variant.json" \
+              --output "result/raw/final-scans/${variant}.json" \
               "$image"
 
-            summarize_scan \
-              "result/raw/trivy-final-$variant.json" "$variant" "FINAL"
+            # Smoke test.
+            port="$((3100 + ${#variant}))"
 
-            # Smoke test
             case "$variant" in
               alpine) port=3101 ;;
               debian) port=3102 ;;
@@ -257,97 +324,302 @@ jobs:
               distroless) port=3104 ;;
             esac
 
-            smoke="PASSED"
+            bash scripts/smoke-test.sh "$image" "$port"
 
-            if ! bash scripts/smoke-test.sh "$image" "$port"; then
-              smoke="FAILED"
-              overall_failed=1
-            fi
+            # Inspect runtime filesystem.
+            container="inspect-${variant}-${GITHUB_RUN_ID}"
 
-            # Inspect runtime filesystem
-            container=$(docker create "$image")
-            rootfs=$(mktemp)
+            docker create \
+              --name "$container" \
+              "$image" >/dev/null
 
-            docker export "$container" > "$rootfs"
+            docker export "$container" \
+              | tar -tf - \
+              > "result/raw/inspection/${variant}-filesystem.txt"
+
             docker rm "$container" >/dev/null
 
-            files=$(tar -tf "$rootfs" | sed 's#^\./##')
-            rm -f "$rootfs"
+            filesystem="result/raw/inspection/${variant}-filesystem.txt"
 
-            has_tool() {
-              if awk -F/ -v name="$1" \
-                '$NF == name { found=1 } END { exit !found }' <<< "$files"; then
-                echo "Yes"
-              else
-                echo "No"
-              fi
+            has_path() {
+              local path="$1"
+              grep -Eq "(^|/)${path}(/|$)" "$filesystem"
             }
 
-            shell=$(has_tool sh)
-            bash_tool=$(has_tool bash)
+            {
+              echo "Variant: $variant"
 
-            package_manager="None"
+              if has_path "sh"; then
+                echo "Shell: yes"
+              else
+                echo "Shell: no"
+              fi
 
-            if grep -Eq '(^|/)apk$' <<< "$files"; then
-              package_manager="apk"
-            elif grep -Eq '(^|/)apt-get$' <<< "$files"; then
-              package_manager="apt"
+              if has_path "bash"; then
+                echo "Bash: yes"
+              else
+                echo "Bash: no"
+              fi
+
+              if has_path "apk" || has_path "apt" || has_path "apt-get" \
+                || has_path "dpkg" || has_path "yum" \
+                || has_path "microdnf"; then
+                echo "Package manager: yes"
+              else
+                echo "Package manager: no"
+              fi
+
+              debug_tools=()
+
+              for tool in curl wget busybox ping; do
+                if has_path "$tool"; then
+                  debug_tools+=("$tool")
+                fi
+              done
+
+              if [[ ${#debug_tools[@]} -gt 0 ]]; then
+                echo "Debug tools: ${debug_tools[*]}"
+              else
+                echo "Debug tools: none detected"
+              fi
+            } > "result/raw/inspection/${variant}-usability.txt"
+
+            # Image size.
+            docker image inspect "$image" \
+              --format '{{.Size}}' \
+              > "result/raw/inspection/${variant}-size-bytes.txt"
+
+            # Record image details.
+            {
+              echo "Image: $image"
+              echo "Image ID:"
+              docker image inspect "$image" --format '{{.Id}}'
+              echo "Repo digests:"
+              docker image inspect "$image" \
+                --format '{{join .RepoDigests ";"}}'
+              echo "Image size (bytes):"
+              cat "result/raw/inspection/${variant}-size-bytes.txt"
+            } >> "result/raw/inspection/${variant}-metadata.txt"
+
+            # Record Node version.
+            if [[ "$variant" == "distroless" ]]; then
+              node_binary="/nodejs/bin/node"
+            else
+              node_binary="/usr/local/bin/node"
             fi
 
-            debug_tools=()
+            docker run --rm \
+              --entrypoint "$node_binary" \
+              "$image" \
+              --version \
+              > "result/raw/inspection/${variant}-node-version.txt"
 
-            for tool in curl wget busybox strace gdb ps top \
-                        netstat ss ping nslookup ip lsof file; do
-              if grep -Eq "(^|/)$tool$" <<< "$files"; then
-                debug_tools+=("$tool")
+            echo "Completed: $variant"
+          done
+
+      - name: Generate benchmark reports
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p result
+
+          variants=(alpine debian slim distroless)
+          severities=(CRITICAL HIGH MEDIUM LOW UNKNOWN)
+
+          count_scan() {
+            local file="$1"
+            local package_class="$2"
+            local severity="$3"
+            local fixed_status="$4"
+
+            if [[ ! -f "$file" ]]; then
+              echo "N/A"
+              return
+            fi
+
+            jq -r \
+              --arg package_class "$package_class" \
+              --arg severity "$severity" \
+              --arg fixed_status "$fixed_status" '
+                [
+                  .Results[]?.Vulnerabilities[]?
+                  | select(
+                      if $package_class == "os" then
+                        .Class == "os-pkgs"
+                      elif $package_class == "npm" then
+                        .Type == "npm"
+                      else
+                        true
+                      end
+                    )
+                  | select(
+                      if $severity == "ALL" then
+                        true
+                      else
+                        ((.Severity // "UNKNOWN") | ascii_upcase) == $severity
+                      end
+                    )
+                  | select(
+                      if $fixed_status == "fixed" then
+                        ((.FixedVersion // "") != "")
+                      elif $fixed_status == "unfixed" then
+                        ((.FixedVersion // "") == "")
+                      else
+                        true
+                      end
+                    )
+                  | {
+                      id: (.VulnerabilityID // "UNKNOWN"),
+                      package: (.PkgName // "UNKNOWN")
+                    }
+                ]
+                | unique_by([.id, .package])
+                | length
+              ' "$file"
+          }
+
+          {
+            echo "# Docker Benchmark Results"
+            echo
+            echo "Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo
+            echo "Git commit: $(git rev-parse HEAD)"
+            echo
+            echo "## Image sizes and build times"
+            echo
+            echo "| Variant | Image size (bytes) | Median build time (seconds) |"
+            echo "|---|---:|---:|"
+
+            for variant in "${variants[@]}"; do
+              size_file="result/raw/inspection/${variant}-size-bytes.txt"
+              time_file="result/raw/build-times/${variant}-median.txt"
+
+              size="N/A"
+              build_time="N/A"
+
+              [[ -f "$size_file" ]] && size="$(cat "$size_file")"
+              [[ -f "$time_file" ]] && build_time="$(cat "$time_file")"
+
+              echo "| $variant | $size | $build_time |"
+            done
+
+            echo
+            echo "## Vulnerability counts"
+            echo
+            echo "Counts are unique by vulnerability ID and package name."
+            echo
+            echo "| Image | Package type | Severity | Total | Fixed | Unfixed |"
+            echo "|---|---|---|---:|---:|---:|"
+
+            for variant in "${variants[@]}"; do
+              for image_type in base final; do
+                if [[ "$image_type" == "base" ]]; then
+                  scan_file="result/raw/base-scans/${variant}.json"
+                else
+                  scan_file="result/raw/final-scans/${variant}.json"
+                fi
+
+                for package_class in os npm; do
+                  for severity in "${severities[@]}"; do
+                    total="$(count_scan "$scan_file" "$package_class" "$severity" all)"
+                    fixed="$(count_scan "$scan_file" "$package_class" "$severity" fixed)"
+                    unfixed="$(count_scan "$scan_file" "$package_class" "$severity" unfixed)"
+
+                    echo "| $variant ($image_type) | $package_class | $severity | $total | $fixed | $unfixed |"
+                  done
+                done
+              done
+            done
+
+            echo
+            echo "## Runtime usability"
+            echo
+            echo "| Variant | Shell | Bash | Package manager | Debug tools |"
+            echo "|---|---|---|---|---|"
+
+            for variant in "${variants[@]}"; do
+              file="result/raw/inspection/${variant}-usability.txt"
+
+              if [[ -f "$file" ]]; then
+                shell_value="$(awk -F': ' '/^Shell:/ {print $2}' "$file")"
+                bash_value="$(awk -F': ' '/^Bash:/ {print $2}' "$file")"
+                package_value="$(awk -F': ' '/^Package manager:/ {print $2}' "$file")"
+                debug_value="$(awk -F': ' '/^Debug tools:/ {print $2}' "$file")"
+
+                echo "| $variant | $shell_value | $bash_value | $package_value | $debug_value |"
+              else
+                echo "| $variant | N/A | N/A | N/A | N/A |"
               fi
             done
 
-            if [[ ${#debug_tools[@]} -eq 0 ]]; then
-              debug="None"
-            else
-              debug=$(IFS=';'; echo "${debug_tools[*]}")
-            fi
+            echo
+            echo "## Node versions"
+            echo
+            for variant in "${variants[@]}"; do
+              file="result/raw/inspection/${variant}-node-version.txt"
 
-            # Image size and metadata
-            size_bytes=$(docker image inspect "$image" --format '{{.Size}}')
-            size_mb=$(awk "BEGIN {printf \"%.2f\", $size_bytes/1024/1024}")
+              if [[ -f "$file" ]]; then
+                echo "- $variant: $(cat "$file")"
+              else
+                echo "- $variant: N/A"
+              fi
+            done
 
-            base_id=$(docker image inspect "$base_image" --format '{{.Id}}')
-            base_digests=$(docker image inspect "$base_image" \
-              --format '{{join .RepoDigests ";"}}')
+            echo
+            echo "## Notes"
+            echo
+            echo "- Build time is the median of three cache-disabled builds."
+            echo "- Base images are pulled before build timing begins."
+            echo "- Vulnerability counts are separated into OS packages and npm packages."
+            echo "- Unknown severity findings are reported separately."
+            echo "- Fixed and unfixed findings are distinguished using Trivy FixedVersion."
+            echo "- Unit and E2E tests are run locally before pushing; they are not repeated in this workflow."
+            echo "- Trivy findings depend on the vulnerability database and distribution advisories."
+            echo "- CVE counts alone do not represent the complete security posture of an image."
+          } > result/ci-results.md
 
-            final_id=$(docker image inspect "$image" --format '{{.Id}}')
+          {
+            echo "variant,image_size_bytes,median_build_seconds"
+            for variant in "${variants[@]}"; do
+              size="N/A"
+              build_time="N/A"
 
-            if [[ "$variant" == "distroless" ]]; then
-              node_path="/nodejs/bin/node"
-            else
-              node_path="/usr/local/bin/node"
-            fi
+              [[ -f "result/raw/inspection/${variant}-size-bytes.txt" ]] \
+                && size="$(cat "result/raw/inspection/${variant}-size-bytes.txt")"
 
-            node_version=$(docker run --rm \
-              --entrypoint "$node_path" "$image" --version)
+              [[ -f "result/raw/build-times/${variant}-median.txt" ]] \
+                && build_time="$(cat "result/raw/build-times/${variant}-median.txt")"
 
-            {
-              echo "Base image ID: $base_id"
-              echo "Base image RepoDigests: $base_digests"
-              echo "Final image ID: $final_id"
-              echo "Node version: $node_version"
-              echo "Build median seconds: $build_median"
-              echo "Final image size bytes: $size_bytes"
-            } >> "result/raw/metadata-$variant.txt"
+              echo "${variant},${size},${build_time}"
+            done
+          } > result/ci-results.csv
 
-            echo "$variant,$node_version,$base_image,$base_id,$base_digests,$final_id,$build_median,$smoke,$shell,$bash_tool,$package_manager,$debug,$size_mb" \
-              >> result/ci-results.csv
+          {
+            echo "variant,image_type,package_type,severity,total,fixed,unfixed"
+            for variant in "${variants[@]}"; do
+              for image_type in base final; do
+                if [[ "$image_type" == "base" ]]; then
+                  scan_file="result/raw/base-scans/${variant}.json"
+                else
+                  scan_file="result/raw/final-scans/${variant}.json"
+                fi
 
-            echo "| $variant | $node_version | $build_median | $smoke | $shell | $bash_tool | $package_manager | $debug | $size_mb |" \
-              >> result/ci-results.md
-          done
+                for package_class in os npm; do
+                  for severity in "${severities[@]}"; do
+                    total="$(count_scan "$scan_file" "$package_class" "$severity" all)"
+                    fixed="$(count_scan "$scan_file" "$package_class" "$severity" fixed)"
+                    unfixed="$(count_scan "$scan_file" "$package_class" "$severity" unfixed)"
 
-          if [[ "$overall_failed" -ne 0 ]]; then
-            echo "One or more smoke tests failed."
-            exit 1
-          fi
+                    echo "${variant},${image_type},${package_class},${severity},${total},${fixed},${unfixed}"
+                  done
+                done
+              done
+            done
+          } > result/trivy-results.csv
+
+          echo "Reports generated."
 
       - name: Upload benchmark results
         if: always()
@@ -356,3 +628,4 @@ jobs:
           name: docker-benchmark-results
           path: result/
           if-no-files-found: warn
+          retention-days: 30
