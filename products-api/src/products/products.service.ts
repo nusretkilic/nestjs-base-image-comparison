@@ -1,11 +1,11 @@
-
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { Product } from './entities/product.entity';
 
 @Injectable()
 export class ProductsService {
+  private readonly logger = new Logger(ProductsService.name);
   private products: Product[] = [];
   private nextId = 1;
 
@@ -16,6 +16,7 @@ export class ProductsService {
     };
 
     this.products.push(product);
+    this.logger.log(`Product created: id=${product.id}`);
 
     return product;
   }
@@ -38,6 +39,7 @@ export class ProductsService {
     const product = this.findOne(id);
 
     Object.assign(product, updateProductDto);
+    this.logger.log(`Product updated: id=${product.id}`);
 
     return product;
   }
@@ -46,5 +48,7 @@ export class ProductsService {
     const product = this.findOne(id);
 
     this.products = this.products.filter((item) => item.id !== product.id);
+    this.logger.log(`Product deleted: id=${product.id}`);
   }
 }
+

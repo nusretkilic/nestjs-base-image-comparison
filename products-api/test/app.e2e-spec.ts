@@ -21,11 +21,11 @@ describe('Products API (e2e)', () => {
   });
 
   // GET /
-  it('GET / should return Hello World', () => {
+  it('GET / should return Products API is running', () => {
     return request(app.getHttpServer())
       .get('/')
       .expect(200)
-      .expect('Hello World!');
+      .expect('Products API is running');
   });
 
   // POST /products
