@@ -77,7 +77,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           trivy image --download-db-only
 
       - name: Resolve and pull base images
@@ -187,7 +186,6 @@ jobs:
               --output "result/raw/base-scans/${variant}.json" \
               "$base_image"
 
-            # Ensure that an OS package scan was actually performed.
             jq -e '
               [.Results[]? | select(.Class == "os-pkgs")]
               | length > 0
@@ -219,7 +217,6 @@ jobs:
               --no-fund
           )
 
-          # Check that the generated lockfile contains package entries.
           jq -e '
             (.packages | type == "object")
             and
@@ -234,14 +231,28 @@ jobs:
             --output result/raw/npm-production.json \
             "$npm_dir"
 
-          # Do not report zero vulnerabilities if Trivy failed to detect
-          # the npm dependency ecosystem.
+          echo "Detected Trivy package types:"
+          jq -r '
+            .Results[]?
+            | [
+                .Class // "UNKNOWN",
+                .Type // "UNKNOWN",
+                .Target // "UNKNOWN"
+              ]
+            | @tsv
+          ' result/raw/npm-production.json
+
+          # Trivy versions and scanners can report npm packages
+          # using either node-pkg or npm as the result type.
           jq -e '
             [
               .Results[]?
               | select(
                   .Class == "lang-pkgs"
-                  and .Type == "node-pkg"
+                  and (
+                    .Type == "node-pkg"
+                    or .Type == "npm"
+                  )
                 )
             ]
             | length > 0
@@ -302,7 +313,6 @@ jobs:
               --output "result/raw/final-scans/${variant}.json" \
               "$image"
 
-            # Validate OS scan results.
             jq -e '
               [.Results[]? | select(.Class == "os-pkgs")]
               | length > 0
@@ -346,7 +356,7 @@ jobs:
             tar -tf "$filesystem_tar" \
               > "result/raw/inspection/${variant}-filesystem.txt"
 
-            # Inspect actual executable files and executable symlinks.
+            # Detect executable files and executable symbolic links.
             python3 - \
               "$filesystem_tar" \
               "result/raw/inspection/${variant}-executables.txt" <<'PY'
@@ -361,7 +371,7 @@ jobs:
               members = {}
 
               for member in archive.getmembers():
-                  name = member.name.lstrip("./")
+                  name = member.name.removeprefix("./").lstrip("/")
                   if name:
                       members[name] = member
 
@@ -538,7 +548,10 @@ jobs:
               .Results[]?
               | select(
                   .Class == "lang-pkgs"
-                  and .Type == "node-pkg"
+                  and (
+                    .Type == "node-pkg"
+                    or .Type == "npm"
+                  )
                 )
             ]
             | length > 0
@@ -580,7 +593,10 @@ jobs:
                         $result.Class == "os-pkgs"
                       elif $package_class == "npm" then
                         $result.Class == "lang-pkgs"
-                        and $result.Type == "node-pkg"
+                        and (
+                          $result.Type == "node-pkg"
+                          or $result.Type == "npm"
+                        )
                       else
                         true
                       end
@@ -630,9 +646,7 @@ jobs:
             echo "- The application source code and dependency lockfile are shared."
             echo "- Base image references are pinned by digest."
             echo "- Runtime base images are scanned separately from final images."
-            echo "- Production npm dependencies are scanned from a production-only lockfile."
-            echo "- Development dependencies are excluded from the npm scan."
-            echo "- npm scan output is validated to ensure Trivy detects node-pkg results."
+            echo "- Production npm dependencies are scanned from a lockfile generated with --omit=dev."
             echo "- Each image is built three times with Docker build cache disabled."
             echo "- The median of the three build times is reported."
             echo "- Base images are pulled before build timing begins."
@@ -695,7 +709,7 @@ jobs:
             echo "## 5. Production npm vulnerability results"
             echo
             echo "The same production-only package lockfile is used for all four variants."
-            echo "Development dependencies are excluded."
+            echo "Development dependencies are excluded according to npm's omit configuration."
             echo "These results describe application dependencies, not OS packages."
             echo
             echo "| Variant | Severity | Total | Fix available | No fix available |"
@@ -765,7 +779,7 @@ jobs:
             echo "- No fix available means Trivy did not report a FixedVersion for that finding."
             echo "- Vulnerability counts are unique by vulnerability ID and package name."
             echo "- The production npm scan uses a lockfile generated with --omit=dev."
-            echo "- The npm scan is shared across variants because application dependencies are identical."
+            echo "- npm results are shared across variants because application dependencies are identical."
             echo "- Runtime usability checks inspect executable files and executable symbolic links in the final image filesystem."
             echo "- Shell is reported when a shell executable or BusyBox shell implementation is present."
             echo "- The base-image scan covers the runtime base image. It does not separately report vulnerabilities in builder-only images."
@@ -778,7 +792,6 @@ jobs:
             echo "Raw Trivy JSON scans, build timings, image metadata, filesystem inspection results and environment metadata are included in the result artifact."
           } > result/benchmark-summary.md
 
-          # Preserve the existing Markdown report filename.
           cp result/benchmark-summary.md result/ci-results.md
 
           # General benchmark CSV.
@@ -871,7 +884,6 @@ jobs:
           destination = Path("result/benchmark-summary.pdf")
 
           lines = source.read_text(encoding="utf-8").splitlines()
-
           page_width, _ = landscape(A4)
 
           doc = SimpleDocTemplate(
@@ -959,10 +971,7 @@ jobs:
           def is_table_separator(line):
               cells = parse_table_row(line)
 
-              if not cells:
-                  return False
-
-              return all(
+              return bool(cells) and all(
                   re.fullmatch(r":?-{3,}:?", cell) is not None
                   for cell in cells
               )
@@ -973,8 +982,6 @@ jobs:
           code_lines = []
 
           def flush_code():
-              global code_lines
-
               if not code_lines:
                   return
 
@@ -1030,79 +1037,73 @@ jobs:
                       table_lines.append(lines[index])
                       index += 1
 
-                  if len(table_lines) >= 2:
-                      parsed_rows = [
-                          parse_table_row(row)
-                          for row in table_lines
-                          if not is_table_separator(row)
-                      ]
+                  parsed_rows = [
+                      parse_table_row(row)
+                      for row in table_lines
+                      if not is_table_separator(row)
+                  ]
 
-                      if parsed_rows:
-                          column_count = max(
-                              len(row) for row in parsed_rows
+                  if parsed_rows:
+                      column_count = max(
+                          len(row) for row in parsed_rows
+                      )
+
+                      table_data = []
+
+                      for row_number, row in enumerate(parsed_rows):
+                          row = row + [""] * (
+                              column_count - len(row)
                           )
 
-                          table_data = []
+                          style = (
+                              table_header_style
+                              if row_number == 0
+                              else table_cell_style
+                          )
 
-                          for row_number, row in enumerate(parsed_rows):
-                              row = row + [""] * (
-                                  column_count - len(row)
+                          table_data.append([
+                              Paragraph(
+                                  markdown_to_reportlab(cell),
+                                  style
                               )
+                              for cell in row
+                          ])
 
-                              style = (
-                                  table_header_style
-                                  if row_number == 0
-                                  else table_cell_style
-                              )
+                      available_width = (
+                          page_width
+                          - doc.leftMargin
+                          - doc.rightMargin
+                      )
 
-                              table_data.append([
-                                  Paragraph(
-                                      markdown_to_reportlab(cell),
-                                      style
-                                  )
-                                  for cell in row
-                              ])
+                      column_width = available_width / column_count
 
-                          available_width = (
-                              page_width
-                              - doc.leftMargin
-                              - doc.rightMargin
-                          )
+                      table = LongTable(
+                          table_data,
+                          colWidths=[column_width] * column_count,
+                          repeatRows=1,
+                          hAlign="LEFT",
+                      )
 
-                          column_width = (
-                              available_width / column_count
-                          )
+                      table.setStyle(TableStyle([
+                          ("BACKGROUND", (0, 0), (-1, 0),
+                           colors.HexColor("#183153")),
+                          ("TEXTCOLOR", (0, 0), (-1, 0),
+                           colors.white),
+                          ("GRID", (0, 0), (-1, -1),
+                           0.35, colors.HexColor("#C8D0D9")),
+                          ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                          ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                          ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                          ("TOPPADDING", (0, 0), (-1, -1), 3),
+                          ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                          ("ROWBACKGROUNDS", (0, 1), (-1, -1), [
+                              colors.white,
+                              colors.HexColor("#F2F5F8"),
+                          ]),
+                      ]))
 
-                          table = LongTable(
-                              table_data,
-                              colWidths=[
-                                  column_width
-                              ] * column_count,
-                              repeatRows=1,
-                              hAlign="LEFT",
-                          )
-
-                          table.setStyle(TableStyle([
-                              ("BACKGROUND", (0, 0), (-1, 0),
-                               colors.HexColor("#183153")),
-                              ("TEXTCOLOR", (0, 0), (-1, 0),
-                               colors.white),
-                              ("GRID", (0, 0), (-1, -1),
-                               0.35, colors.HexColor("#C8D0D9")),
-                              ("VALIGN", (0, 0), (-1, -1),
-                               "TOP"),
-                              ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                              ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                              ("TOPPADDING", (0, 0), (-1, -1), 3),
-                              ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                              ("ROWBACKGROUNDS", (0, 1), (-1, -1), [
-                                  colors.white,
-                                  colors.HexColor("#F2F5F8"),
-                              ]),
-                          ]))
-
-                          story.append(table)
-                          story.append(Spacer(1, 7))
+                      story.append(table)
+                      story.append(Spacer(1, 7))
 
                   continue
 
