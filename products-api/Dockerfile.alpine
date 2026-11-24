@@ -1,9 +1,5 @@
-# Alpine runtime: Node.js 24.
-# Before experiment measurements, select the exact Node.js and Alpine
-# versions and pin NODE_IMAGE by digest.
-ARG NODE_IMAGE=node:24-alpine
+ARG NODE_IMAGE=node:24.14.0-alpine@sha256:7fddd9ddeae8196abf4a3ef2de34e11f7b1a722119f91f28ddf1e99dcafdf114
 
-# Stage 1: compile the application in an Alpine environment.
 FROM ${NODE_IMAGE} AS build
 WORKDIR /app
 
@@ -16,14 +12,12 @@ RUN npm run build \
     && test -f dist/main.js \
     && find dist -type f \( -name '*.d.ts' -o -name '*.map' \) -delete
 
-# Stage 2: install production dependencies for Alpine's musl environment.
 FROM ${NODE_IMAGE} AS production-dependencies
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
-# Stage 3: run the application on the Alpine image.
 FROM ${NODE_IMAGE} AS runtime
 ENV NODE_ENV=production PORT=3000
 WORKDIR /app

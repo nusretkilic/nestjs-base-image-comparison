@@ -1,9 +1,5 @@
-# Full Debian baseline: Node.js 24 on Debian 12 Bookworm.
-# Before experiment measurements, override NODE_IMAGE with the selected
-# exact-version Node.js image reference pinned by digest.
-ARG NODE_IMAGE=node:24-bookworm
+ARG NODE_IMAGE=node:24.14.0-bookworm@sha256:5a593d74b632d1c6f816457477b6819760e13624455d587eef0fa418c8d0777b
 
-# Stage 1: compile the application.
 FROM ${NODE_IMAGE} AS build
 WORKDIR /app
 
@@ -16,14 +12,12 @@ RUN npm run build \
     && test -f dist/main.js \
     && find dist -type f \( -name '*.d.ts' -o -name '*.map' \) -delete
 
-# Stage 2: install production dependencies.
 FROM ${NODE_IMAGE} AS production-dependencies
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
-# Stage 3: run the application on the full Debian image.
 FROM ${NODE_IMAGE} AS runtime
 ENV NODE_ENV=production PORT=3000
 WORKDIR /app

@@ -1,11 +1,6 @@
-# Distroless runtime: Node.js 24 on Debian 12.
-# The runtime digest comes from the verified registry output.
-# Before measurements, match the Node.js patch versions where available
-# and pin NODE_IMAGE by digest.
-ARG NODE_IMAGE=node:24-bookworm
+ARG NODE_IMAGE=node:24.14.0-bookworm@sha256:5a593d74b632d1c6f816457477b6819760e13624455d587eef0fa418c8d0777b
 ARG RUNTIME_IMAGE=gcr.io/distroless/nodejs24-debian12:nonroot@sha256:14d42e2511532589a7c7e01a753667a74fcc96266e137e8125006b87b0c32d0a
 
-# Stage 1: compile in the Debian 12 build environment.
 FROM ${NODE_IMAGE} AS build
 WORKDIR /app
 
@@ -18,14 +13,12 @@ RUN npm run build \
     && test -f dist/main.js \
     && find dist -type f \( -name '*.d.ts' -o -name '*.map' \) -delete
 
-# Stage 2: install production dependencies in Debian 12.
 FROM ${NODE_IMAGE} AS production-dependencies
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
-# Stage 3: run the application without a shell or npm.
 FROM ${RUNTIME_IMAGE} AS runtime
 ENV NODE_ENV=production PORT=3000
 WORKDIR /app
