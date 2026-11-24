@@ -1,0 +1,71 @@
+PRE-CI VALIDATION: PASSED
+
+UNIT TEST RESULTS
+===== UNIT TEST: alpine =====
+PASS src/products/products.service.spec.ts
+PASS src/app.controller.spec.ts
+PASS src/products/products.controller.spec.ts
+Test Suites: 3 passed, 3 total
+Tests:       13 passed, 13 total
+Snapshots:   0 total
+Time:        0.45 s
+Ran all test suites.
+===== UNIT TEST: debian =====
+PASS src/products/products.service.spec.ts
+PASS src/app.controller.spec.ts
+PASS src/products/products.controller.spec.ts
+Test Suites: 3 passed, 3 total
+Tests:       13 passed, 13 total
+Snapshots:   0 total
+Time:        0.391 s
+Ran all test suites.
+===== UNIT TEST: slim =====
+PASS src/products/products.service.spec.ts
+PASS src/app.controller.spec.ts
+PASS src/products/products.controller.spec.ts
+Test Suites: 3 passed, 3 total
+Tests:       13 passed, 13 total
+Snapshots:   0 total
+Time:        0.397 s
+Ran all test suites.
+===== UNIT TEST: distroless =====
+PASS src/products/products.service.spec.ts
+PASS src/app.controller.spec.ts
+PASS src/products/products.controller.spec.ts
+Test Suites: 3 passed, 3 total
+Tests:       13 passed, 13 total
+Snapshots:   0 total
+Time:        0.406 s
+Ran all test suites.
+
+E2E TEST RESULTS
+===== E2E TEST: alpine =====
+PASS test/app.e2e-spec.ts
+Test Suites: 1 passed, 1 total
+Tests:       12 passed, 12 total
+Snapshots:   0 total
+Time:        0.421 s
+Ran all test suites.
+===== E2E TEST: debian =====
+PASS test/app.e2e-spec.ts
+Test Suites: 1 passed, 1 total
+Tests:       12 passed, 12 total
+Snapshots:   0 total
+Time:        0.377 s
+Ran all test suites.
+===== E2E TEST: slim =====
+PASS test/app.e2e-spec.ts
+Test Suites: 1 passed, 1 total
+Tests:       12 passed, 12 total
+Snapshots:   0 total
+Time:        0.388 s
+Ran all test suites.
+===== E2E TEST: distroless =====
+PASS test/app.e2e-spec.ts
+Test Suites: 1 passed, 1 total
+Tests:       12 passed, 12 total
+Snapshots:   0 total
+Time:        0.384 s
+Ran all test suites.
+
+OVERALL: PASSED
